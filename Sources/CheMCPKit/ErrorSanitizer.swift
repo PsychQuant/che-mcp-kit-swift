@@ -1,0 +1,297 @@
+import Foundation
+
+/// Maps a Swift `Error` to a stable string code that is safe to embed in MCP
+/// responses (and the `--cli` error envelope). Framework-produced
+/// `localizedDescription` strings can interpolate user-controlled content — event or
+/// recording titles, file paths — so they are never forwarded verbatim.
+///
+/// The sanitizer reads only `NSError.domain` and `NSError.code` — never
+/// `userInfo`, `localizedDescription`, or any other field that could carry
+/// human-readable text. The full `localizedDescription` is returned alongside
+/// the sanitized code as `rawLog` so the caller can write it to stderr (or
+/// another trusted channel) without forwarding it to the client.
+///
+/// Callers MUST forward `rawLog` to a trusted channel (typically stderr) when
+/// they would otherwise have used `error.localizedDescription` for debugging
+/// — dropping `rawLog` silently degrades operator visibility. Conversely, the
+/// `code` is the only field safe to embed in client-visible responses.
+
+/// Marker protocol that opts a Swift `Error` type into pass-through dispatch
+/// by `ErrorSanitizer.sanitizeForResponse(_:)` — the type's author
+/// asserts that `errorDescription` (or `localizedDescription`) is hand-written
+/// and safe to forward verbatim to MCP clients without sanitization.
+///
+/// Opt in only when the description is fully author-controlled. Do NOT make
+/// Foundation types like `URLError` / `CocoaError` / `POSIXError` conform —
+/// their messages come from Apple frameworks and may carry user-content.
+/// Checking `is LocalizedError` would be too broad; this empty protocol is
+/// the explicit opt-in (che-ical-mcp's `eventkit-error-sanitization` spec, R5).
+///
+/// **Canonical conformer list** (this package):
+///   - `CLIRunner.CLIError` (CLIRunner.swift)
+///   - `ResponseFormattingError` (ResponseFormatting.swift)
+///
+/// Adding a new conformer here MUST update both this list AND
+/// `TrustedErrorMessageConformerTests`, which pins it. Each server keeps its own list for
+/// its own conformers. Any conformance widens the trust boundary, so PR review SHOULD
+/// verify every `errorDescription` of the new type is fully author-controlled.
+public protocol TrustedErrorMessage {}
+
+public enum ErrorSanitizer {
+
+    public static func sanitize(_ error: Error) -> SanitizedError {
+        let nsError = error as NSError
+        let rawLog = nsError.localizedDescription
+        // che-ical-mcp spec R4 fixes the response value-domain regex to `[0-9]+`. NSError.code
+        // is a signed Int and some Foundation domains carry negative values
+        // historically; using the absolute value preserves a stable encoding
+        // (operators can still recover the magnitude) while keeping the regex
+        // an invariant of the sanitizer's output.
+        let codeMagnitude = nsError.code.magnitude
+
+
+        if isSwiftBridged(error: error, nsError: nsError) {
+            return SanitizedError(code: "error_unknown", rawLog: rawLog)
+        }
+
+        let slug = slugifyDomain(nsError.domain)
+        return SanitizedError(code: "error_\(slug)_\(codeMagnitude)", rawLog: rawLog)
+    }
+
+    // Swift `Error` values bridged to `NSError` by the runtime carry a domain
+    // synthesised from the Swift type name, i.e. `String(reflecting: type(of:))`
+    // — a leak of source-code identifiers we don't want in client-visible
+    // output. A "real" NSError (constructed via `NSError(domain:code:)`) has a
+    // domain that does NOT match its dynamic Swift type, so this comparison
+    // distinguishes the two cleanly without relying on prefix heuristics.
+    private static func isSwiftBridged(error: Error, nsError: NSError) -> Bool {
+        nsError.domain == String(reflecting: type(of: error))
+    }
+
+    private static func slugifyDomain(_ domain: String) -> String {
+        let tail: String
+        if let dot = domain.lastIndex(of: ".") {
+            tail = String(domain[domain.index(after: dot)...])
+        } else {
+            tail = domain
+        }
+
+        var result = ""
+        result.reserveCapacity(tail.count)
+        for scalar in tail.unicodeScalars {
+            let v = scalar.value
+            if (0x61...0x7A).contains(v) {           // a-z
+                result.unicodeScalars.append(scalar)
+            } else if (0x41...0x5A).contains(v) {    // A-Z → lowercase
+                result.unicodeScalars.append(Unicode.Scalar(v + 0x20)!)
+            } else if (0x30...0x39).contains(v) {    // 0-9
+                result.unicodeScalars.append(scalar)
+            } else {
+                result.append("_")
+            }
+        }
+        return result
+    }
+}
+
+public struct SanitizedError: Sendable, Equatable {
+    public let code: String
+    public let rawLog: String
+
+    public init(code: String, rawLog: String) {
+        self.code = code
+        self.rawLog = rawLog
+    }
+}
+
+extension ErrorSanitizer {
+
+    /// Type-driven dispatch for non-cleanup callers (che-ical-mcp spec R6). For author-
+    /// controlled errors marked `TrustedErrorMessage`, returns the original
+    /// `localizedDescription` so operator-friendly authored messages survive.
+    /// Otherwise delegates to `sanitize(_:)`, preserving che-ical-mcp#32's R1–R4
+    /// invariants (regex value-domain) for framework-thrown errors.
+    public static func sanitizeForResponse(_ error: Error) -> SanitizedError {
+        if error is TrustedErrorMessage {
+            let text = error.localizedDescription
+            return SanitizedError(code: text, rawLog: text)
+        }
+        return sanitize(error)
+    }
+
+    /// Per-line cap on `rawLog` written to stderr by `writeFailureLog`.
+    /// Framework `NSError.localizedDescription` is theoretically unbounded;
+    /// without a cap, one oversize framework error could turn into MB-scale
+    /// stderr volume, and repeated failing calls multiply it (che-ical-mcp#86, where
+    /// batch handlers made this acute). 1024 *characters* (Swift `String.count`,
+    /// i.e. extended grapheme clusters — not UTF-8 bytes) is well above the
+    /// framework error descriptions seen in practice while still bounding the per-line cost. Pathological multi-byte
+    /// graphemes (compound emoji etc.) can expand the post-escape byte count
+    /// well beyond the cap; treat the bound as ~kilobytes per line, not exact
+    /// byte budget. Public so tests can pin the value. See che-ical-mcp#86 for tuning.
+    public static let maxRawLogChars = 1024
+
+    /// Combines `sanitizeForResponse` with operator stderr logging in one
+    /// call (che-ical-mcp spec R7). The `handler` and `identifier` parameters tag the
+    /// stderr line with context for operator debugging. Returns the
+    /// sanitized `code` for the caller to embed into the MCP response.
+    ///
+    /// Control characters (`\n`, `\r`) in `handler` / `identifier` / `rawLog`
+    /// are escaped to `\\n` / `\\r` before the stderr write to prevent log
+    /// injection (che-ical-mcp#37 F2): `identifier` is typically the tool name from the
+    /// request, which the client controls, and `rawLog` is framework text; a `\n` in
+    /// either would forge fake stderr lines visible to the operator.
+    ///
+    /// **Trusted-branch carve-out (che-ical-mcp#41, che-ical-mcp spec R7 amendment)**: when `error`
+    /// conforms to `TrustedErrorMessage`, the stderr write is skipped because
+    /// `code == rawLog == localizedDescription` — the wire response already
+    /// carries the same string and stderr would just duplicate. This avoids
+    /// stderr amplification when a client sends many malformed calls
+    /// (each a trusted invalid-parameter error) → as many redundant stderr lines.
+    /// Framework errors still write to stderr because they are the only
+    /// operator-debuggable channel for the un-sanitized `localizedDescription`.
+    ///
+    /// **Length cap (che-ical-mcp#86)**: `rawLog` is truncated to `maxRawLogChars`
+    /// characters before `escapeForStderr` (so escape inflation cannot
+    /// expand the budget). Truncated lines carry a `…[truncated N chars]`
+    /// suffix preserving the original size signal for operator debug.
+    ///
+    /// **Concurrency / thread-safety (che-ical-mcp#70)**: `FileHandle.standardError.write`
+    /// is **not documented to be atomic** by Swift. POSIX `write(2)` only
+    /// guarantees atomicity for byte counts ≤ `PIPE_BUF`, which on macOS
+    /// is **512 bytes** (`getconf PIPE_BUF .` → 512; `<sys/syslimits.h>`
+    /// `#define PIPE_BUF 512`). This helper's failure-line emission shape
+    /// `<handler>(<identifier>) failed: <safeRawLog>\n` can easily exceed
+    /// 512 bytes whenever `safeRawLog` is non-trivial: `maxRawLogChars`
+    /// alone is 1024 chars (escape-inflated may grow further), so under
+    /// concurrent `async` failing-tool-call races (multiple
+    /// `handleToolCall` invocations failing in parallel) **stderr lines
+    /// CAN interleave at the kernel level** for non-trivial error
+    /// payloads. Therefore: operators must NOT assume that
+    /// `tail -f stderr | parse-by-line` produces perfectly framed records
+    /// — interleaving is possible under load.
+    ///
+    /// Maintainer chose this best-effort posture (Option C) per `che-ical-mcp#70`
+    /// rather than Option A (`StderrLogger.shared` actor that serializes
+    /// every sanitizer stderr write (11 sites in che-ical-mcp) through a single async
+    /// boundary). Rationale: at this MCP server's concurrency profile
+    /// (single client, mostly serial tool calls), the contention window
+    /// is narrow enough that the implementation cost of Option A
+    /// (touching every catch handler, propagating `await`) exceeds the
+    /// observability value. **Trigger to revisit Option A**: any of
+    ///   1. Multi-tenant deployment with elevated concurrent-failure rates
+    ///   2. SRE / operator surfaces an interleaving-related parsing complaint
+    ///   3. Structured stderr output / stack traces that are themselves
+    ///      load-bearing (today they're best-effort debug, not contracts)
+    ///   4. `che-ical-mcp#66` periodic-summary mechanism lands (5th writer)
+    /// See `che-ical-mcp#70` closing summary for the full deferral context.
+    public static func writeFailureLog(
+        handler: String,
+        identifier: String,
+        error: Error
+    ) -> String {
+        let sanitized = sanitizeForResponse(error)
+        if !(error is TrustedErrorMessage) {
+            let safeHandler = escapeForStderr(handler)
+            let safeIdentifier = escapeForStderr(identifier)
+            // Cap fires BEFORE escapeForStderr so escape inflation
+            // (`\n` → `\\n`, etc.) cannot expand the budget. Suffix
+            // annotation tells operators the original payload size.
+            let truncated: String
+            if sanitized.rawLog.count > maxRawLogChars {
+                let omitted = sanitized.rawLog.count - maxRawLogChars
+                truncated = String(sanitized.rawLog.prefix(maxRawLogChars))
+                    + "…[truncated \(omitted) chars]"
+            } else {
+                truncated = sanitized.rawLog
+            }
+            let safeRawLog = escapeForStderr(truncated)
+            FileHandle.standardError.write(
+                Data("\(safeHandler)(\(safeIdentifier)) failed: \(safeRawLog)\n".utf8)
+            )
+        }
+        return sanitized.code
+    }
+
+    /// Strip control characters that could enable log-injection (CWE-117)
+    /// when an interpolated string is consumed by a non-escaping log writer.
+    /// Removes (silent strip — empty replacement, no visible artifact):
+    /// `\x00..\x1F` (C0 controls including LF/CR/TAB) + `\x7F` (DEL).
+    /// Other Unicode scalars pass through unchanged.
+    ///
+    /// **When to use**: any user-controlled string interpolated into a
+    /// response message that may be consumed by a downstream non-escaping
+    /// log writer (e.g. an MCP host writing the wire `message` field to
+    /// syslog without further escaping). That means request values echoed into
+    /// error messages — e.g. an id in a not-found error — the wire
+    /// is safe (JSON-encoded), but the host's logging discipline is not under
+    /// our control. Stripping at the server-side gives a defensive layer.
+    ///
+    /// **Why "strip" not "escape"**: this is the response-prose boundary
+    /// (visible to humans reading the message). Stripping is silent —
+    /// `"item 'foo\nbar'"` becomes `"item 'foobar'"`, no visual artifact.
+    /// Escape (`escapeForStderr`) is for the *stderr* boundary where the
+    /// operator must SEE the control char to debug. Different audiences,
+    /// different policies — see che-ical-mcp#73 / che-ical-mcp#74 cluster Plan for the rationale.
+    ///
+    /// **Future-contributor guard**: any new error or result message that
+    /// interpolates user-controlled content (titles, ids, paths, rename/move
+    /// arguments) MUST call this helper. Audit the `errorDescription` switches
+    /// before adding a new case.
+    public static func sanitizeForInterpolation(_ s: String) -> String {
+        var result = ""
+        result.reserveCapacity(s.unicodeScalars.count)
+        for scalar in s.unicodeScalars {
+            let v = scalar.value
+            if v < 0x20 || v == 0x7F {
+                continue   // strip C0 + DEL
+            }
+            result.unicodeScalars.append(scalar)
+        }
+        return result
+    }
+
+    /// Escape control characters for safe stderr inclusion. Returns a
+    /// version of `s` with: backslash → `\\`, LF → `\n`, CR → `\r`, and
+    /// **all other C0 controls (`\x00..\x1F`), DEL (`\x7F`), plus the C1
+    /// band (`\x80..\x9F`)** → `\xHH` hex escape. Other Unicode scalars
+    /// (printable ASCII, accents, CJK, emoji — all ≥ `\xA0`) pass through
+    /// unchanged.
+    ///
+    /// **Before che-ical-mcp#73** (3-char fast-path for backslash/LF/CR only) there
+    /// was a known gap: ESC `\x1b` reached stderr verbatim, allowing an
+    /// attacker who controls `localizedDescription` (e.g. via a title
+    /// surfaced in framework error text) to inject ANSI sequences like
+    /// `\x1b[2J\x1b[H` (clear screen + home cursor) that hijack the
+    /// operator's terminal — denial-of-visibility / log forgery class.
+    /// `\x00` was a similar gap (truncates C-string log readers like
+    /// `tail` writing to `syslog`). Closing both via full C0+DEL coverage.
+    ///
+    /// Public (che-ical-mcp#37) so callers that use `sanitize(_:)` directly share
+    /// the same control-char hardening.
+    ///
+    /// **C1 controls (`\x80..\x9F`)** are now also escaped (che-ical-mcp#150) — closes
+    /// the 8-bit CSI alternate form (`\xC2\x9B` ≡ CSI) that could otherwise
+    /// reach the terminal verbatim. Printable scalars start at `\xA0`
+    /// (NBSP), so the C1 range is control-only and safe to escape wholesale.
+    public static func escapeForStderr(_ s: String) -> String {
+        var result = ""
+        result.reserveCapacity(s.unicodeScalars.count)
+        for scalar in s.unicodeScalars {
+            let v = scalar.value
+            switch v {
+            case 0x5C:   // backslash
+                result.append("\\\\")
+            case 0x0A:   // LF
+                result.append("\\n")
+            case 0x0D:   // CR
+                result.append("\\r")
+            case 0x00...0x1F, 0x7F, 0x80...0x9F:   // C0 + DEL + C1
+                result.append(String(format: "\\x%02x", v))
+            default:
+                result.unicodeScalars.append(scalar)
+            }
+        }
+        return result
+    }
+}
