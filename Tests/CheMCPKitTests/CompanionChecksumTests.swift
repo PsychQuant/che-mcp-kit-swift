@@ -42,6 +42,18 @@ struct CompanionChecksumTests {
         #expect(detail(of: Data(body.utf8), status: 200) == "no 64-char hex SHA-256 token found in companion file content")
     }
 
+    @Test func `A bad status is reported before a bad body`() {
+        #expect(detail(of: Data([0xFF, 0xFE]), status: 500) == "HTTP 500 from \(url.absoluteString)")
+        #expect(detail(of: Data(), status: 403) == "HTTP 403 from \(url.absoluteString)")
+    }
+
+    @Test(arguments: [String(repeating: "g", count: 64),          // 64 characters, not hex
+                      String(repeating: "a", count: 65),          // hex, one too long
+                      "  \n\t  "])                                  // whitespace only
+    func `Near-miss digests are refused`(body: String) {
+        #expect(detail(of: Data(body.utf8), status: 200) == "no 64-char hex SHA-256 token found in companion file content")
+    }
+
     @Test func `The refusal message names the manual verification commands`() {
         let message = SelfUpdate.SelfUpdateError.checksumUnavailable("x", teamID: team).localizedDescription
         #expect(message.contains("`codesign --verify --strict -R '=anchor apple generic"))

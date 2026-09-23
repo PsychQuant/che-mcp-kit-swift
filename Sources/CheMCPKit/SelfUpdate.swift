@@ -326,8 +326,8 @@ public enum SelfUpdate {
     /// The step after the companion download: anything but a 200 response holding a
     /// 64-character hex digest refuses the install with `checksumUnavailable` (`statusCode` is
     /// `-1` for a non-HTTP response). Split from the network call so every refusal is testable.
-    public static func expectedHash(fromCompanionBody data: Data, statusCode: Int, url: URL,
-                                    teamID: String) throws -> String {
+    static func expectedHash(fromCompanionBody data: Data, statusCode: Int, url: URL,
+                             teamID: String) throws -> String {
         guard statusCode == 200 else {
             throw SelfUpdateError.checksumUnavailable("HTTP \(statusCode) from \(url.absoluteString)", teamID: teamID)
         }
