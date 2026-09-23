@@ -3,7 +3,8 @@
 Shared building blocks for PsychQuant's macOS MCP servers written in Swift, such as
 [`che-ical-mcp`](https://github.com/PsychQuant/che-ical-mcp). Each server used to carry
 its own copy of this code, and security fixes landed in one copy but not the others.
-This package is the single copy they all depend on.
+This package is meant to be the single copy they all depend on; servers are moving to it
+one at a time.
 
 Library product: `CheMCPKit`. Requires macOS 14 and
 [`modelcontextprotocol/swift-sdk`](https://github.com/modelcontextprotocol/swift-sdk) 0.12.x.
