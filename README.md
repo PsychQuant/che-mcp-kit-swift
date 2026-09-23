@@ -20,7 +20,7 @@ Library product: `CheMCPKit`. Requires macOS 14 and
 | `SelfUpdate` | `--self-update`: fetch the latest GitHub release, check its SHA-256 companion, verify the Developer ID signature and notarization, then atomically replace the running binary. Everything project-specific comes in through `SelfUpdate.Configuration`. |
 | `SystemSignatureVerifier` | `codesign` designated-requirement check pinned to one Developer ID team, plus `spctl` notarization check, both with timeouts. |
 | `SelfUpdate.compareVersions` | SemVer 2.0.0 §11 precedence (pre-releases sort below the release). |
-| `CLIRunner` | `--cli <tool> --key value` / positional JSON / stdin JSON → one tool call through any `CLIToolExecutor`. String-typed schema parameters keep their text verbatim. |
+| `CLIRunner` | `--cli <tool> --key value` / positional JSON / stdin JSON → one tool call through any `CLIToolExecutor`. String-typed schema parameters keep their text verbatim. Failures print the shared error envelope, or a server's own line via `errorFormatter:` when it already has an established `--cli` output format. |
 | `ErrorSanitizer`, `ErrorEnvelope`, `TrustedErrorMessage`, `CodedError` | Keep framework error text out of responses, escape stderr, and emit `{"error":{"code","message"}}`. |
 | `formatJSON` | JSON responses that throw instead of crashing on non-serializable values. |
 | `BinaryPathResolver` | Resolve `argv[0]` (symlinks, bare names via `$PATH`) to the real binary path. |

@@ -251,10 +251,18 @@ public enum CLIRunner {
         return !args[cliIndex + 1].hasPrefix("--")
     }
 
+    /// Formats a failed `--cli` call as the single stdout line. The default is the shared
+    /// `{ "error": { "code", "message" } }` envelope (`formatErrorForCLI`).
+    public typealias ErrorFormatter = (Error) -> String
+
+    public static let defaultErrorFormatter: ErrorFormatter = { formatErrorForCLI($0).jsonMessage }
+
     /// Run CLI mode: detect input source, parse, dispatch, print result. `tools` is the list the
     /// MCP path advertises; `usageName` is the executable name shown in usage errors. A failure
-    /// prints the error envelope and terminates through `Shutdown.terminate(1)`.
-    public static func run(executor: some CLIToolExecutor, tools: [Tool], usageName: String, args: [String]) async {
+    /// prints `errorFormatter`'s line (a server with an established output format passes its
+    /// own) and terminates through `Shutdown.terminate(1)`.
+    public static func run(executor: some CLIToolExecutor, tools: [Tool], usageName: String, args: [String],
+                           errorFormatter: ErrorFormatter = defaultErrorFormatter) async {
         // Hoisted so the catch block can pass it as the writeFailureLog identifier.
         // `nil` covers the case where parsing throws before tool name is known
         // (e.g. CLIError.missingToolName); falls back to "<no-tool>" in handleRunError.
@@ -295,7 +303,7 @@ public enum CLIRunner {
             let result = try await executor.executeToolCall(name: unwrappedToolName, arguments: mcpArgs)
             print(result)
         } catch {
-            handleRunError(error, toolName: toolName)
+            handleRunError(error, toolName: toolName, formatter: errorFormatter)
             Shutdown.terminate(1)   // same single exit path as signals
         }
     }
@@ -307,14 +315,18 @@ public enum CLIRunner {
     /// (che-ical-mcp#37 F2) that the MCP path already enforces (che-ical-mcp spec R3/R7/R8).
     /// Does NOT call `exit()`; the caller is responsible for that so this
     /// helper stays unit-testable without subprocess invocation.
-    public static func handleRunError(_ error: Error, toolName: String?) {
-        let (jsonMessage, _) = formatErrorForCLI(error)
+    /// Returns the line it printed.
+    @discardableResult
+    public static func handleRunError(_ error: Error, toolName: String?,
+                                      formatter: ErrorFormatter = defaultErrorFormatter) -> String {
+        let jsonMessage = formatter(error)
         print(jsonMessage)
         _ = ErrorSanitizer.writeFailureLog(
             handler: "CLIRunner",
             identifier: toolName ?? "<no-tool>",
             error: error
         )
+        return jsonMessage
     }
 
     /// che-ical-mcp#37 verify (Codex medium finding): route CLI errors through the same

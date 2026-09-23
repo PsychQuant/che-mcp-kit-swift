@@ -108,3 +108,17 @@ struct CLIRunnerParsingTests {
         #expect(raw == "secret title")
     }
 }
+
+/// A server can keep its own `--cli` error format; the default stays the shared envelope.
+struct CLIErrorFormatterTests {
+    @Test func `The default formatter prints the shared error envelope`() {
+        let line = CLIRunner.handleRunError(CLIRunner.CLIError.unexpectedPositional, toolName: "t")
+        #expect(line == #"{"error":{"code":"invalid_argument","message":"Unexpected positional argument. Use --key value pairs, or pass one JSON object: --cli <tool> '{\"key\": value}'"}}"#)
+    }
+
+    @Test func `A custom formatter replaces the printed line`() {
+        let line = CLIRunner.handleRunError(CLIRunner.CLIError.missingToolField, toolName: nil,
+                                            formatter: { _ in #"{"error":true,"message":"legacy"}"# })
+        #expect(line == #"{"error":true,"message":"legacy"}"#)
+    }
+}
