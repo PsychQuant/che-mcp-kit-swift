@@ -319,9 +319,17 @@ public enum SelfUpdate {
         } catch {
             throw SelfUpdateError.checksumUnavailable("network: \(error.localizedDescription)", teamID: teamID)
         }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw SelfUpdateError.checksumUnavailable("HTTP \(code) from \(url.absoluteString)", teamID: teamID)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+        return try expectedHash(fromCompanionBody: data, statusCode: statusCode, url: url, teamID: teamID)
+    }
+
+    /// The step after the companion download: anything but a 200 response holding a
+    /// 64-character hex digest refuses the install with `checksumUnavailable` (`statusCode` is
+    /// `-1` for a non-HTTP response). Split from the network call so every refusal is testable.
+    static func expectedHash(fromCompanionBody data: Data, statusCode: Int, url: URL,
+                             teamID: String) throws -> String {
+        guard statusCode == 200 else {
+            throw SelfUpdateError.checksumUnavailable("HTTP \(statusCode) from \(url.absoluteString)", teamID: teamID)
         }
         guard let text = String(data: data, encoding: .utf8) else {
             throw SelfUpdateError.checksumUnavailable("companion file is not UTF-8 text", teamID: teamID)
