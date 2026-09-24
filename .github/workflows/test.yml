@@ -1,0 +1,55 @@
+# Runs `swift build` and `swift test` on every push to main and every PR against it.
+#
+# Runner: macOS, because the package links CommonCrypto and the tests use macOS-only
+# APIs (codesign/spctl stubs, ACLs via `chmod +a`, mkfifo). The opt-in tests that verify a
+# real signed and notarized binary (CHE_MCP_KIT_SIGNED_FIXTURE) are skipped here: CI has no
+# such binary and no need for network notarization lookups.
+#
+# Security: only safe context expressions are used (`github.workflow`, `github.ref`,
+# `runner.os`, `hashFiles`). No untrusted input (PR titles, branch names, commit messages)
+# reaches a `run:` block.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: swift build + swift test
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Show toolchain version
+        run: |
+          swift --version
+          xcodebuild -version
+
+      # Package.resolved is not committed in this library, so the cache key follows Package.swift.
+      - name: Cache SPM .build
+        uses: actions/cache@v5
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: swift build
+        run: swift build
+
+      - name: swift test
+        run: swift test
