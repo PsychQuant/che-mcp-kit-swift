@@ -14,9 +14,9 @@ import Foundation
 // listed in `--help` and README so users find it on demand.
 //
 // **Why atomic replace via POSIX `rename(2)` (che-ical-mcp#49 verify Finding 2)**:
-// the temp file is staged in the target's PARENT directory so that
-// `rename(targetPath_temp → targetPath)` is guaranteed same-filesystem
-// and atomic. POSIX rename(2) semantics: target either points at the
+// the download is staged in a private (0700) directory inside the target's
+// directory, so `rename(staged → targetPath)` is guaranteed same-filesystem
+// and atomic; see `verifyAndInstall` for the threat model (#1). POSIX rename(2) semantics: target either points at the
 // new file or the old file at all times — never absent. This fixes
 // the original (rm -f + mv) approach which had a window where the
 // target didn't exist and could brick the install if mv failed.
@@ -182,13 +182,17 @@ public enum SelfUpdate {
         print("Expected SHA-256: \(expectedHash)")
 
         print("Downloading \(assetName) from \(downloadURL.absoluteString) ...")
-        // Stage temp in target's parent directory so installBinary's
-        // POSIX rename(2) is guaranteed same-FS atomic (che-ical-mcp#49 verify F2).
-        let tempPath = try await downloadBinary(from: downloadURL, targetPath: currentBinaryPath,
-                                                userAgent: configuration.userAgent)
-
-        try verifyAndInstall(temp: tempPath, target: currentBinaryPath,
-                             expectedHash: expectedHash, verifier: configuration.verifier)
+        // Stage in a private 0700 directory inside the target's directory: same volume, so
+        // rename(2) is atomic (che-ical-mcp#49 verify F2). See `verifyAndInstall` for which
+        // accounts that keeps out (#1).
+        try await withStagingDirectory(nextTo: currentBinaryPath) { stagingDirectory in
+            let stagedPath = URL(fileURLWithPath: stagingDirectory)
+                .appendingPathComponent(URL(fileURLWithPath: currentBinaryPath).lastPathComponent).path
+            let tempPath = try await downloadBinary(from: downloadURL, to: stagedPath,
+                                                    userAgent: configuration.userAgent)
+            try verifyAndInstall(temp: tempPath, target: currentBinaryPath,
+                                 expectedHash: expectedHash, verifier: configuration.verifier)
+        }
         print("✓ Installed \(latestVersion) to \(currentBinaryPath)")
         print("ℹ If this binary is currently running as an MCP server, restart your")
         print("  MCP host (Claude Desktop / Claude Code) to pick up the new version.")
@@ -198,12 +202,52 @@ public enum SelfUpdate {
 
     /// Hash → signature → install, in that order (che-ical-mcp#98 for the hash). Any refusal leaves `target` untouched
     /// and removes `temp`; on success `temp` has become `target` via `rename(2)`.
+    ///
+    /// The staged file is opened once, before any check, without following symlinks and without
+    /// blocking on a FIFO. Both hashes are computed from that descriptor, the exec bit is set with
+    /// `fchmod`, and immediately before `rename(2)` the path must still name that same file (#1).
+    /// The signature check itself reads the path; that it saw our file is guaranteed by the private
+    /// staging directory, not by a check, for the accounts the threat model below covers.
+    ///
+    /// Threat model (#1): defended are accounts with no write access to the target's directory and
+    /// accounts that can only *add* entries there because it is sticky (`+t`) — they cannot remove
+    /// or rename the private staging directory `run` creates, cannot enter it, and cannot touch the
+    /// staged file. Not defended, by design: the same user, and any account that can remove or rename
+    /// entries in the target's directory; both can replace the installed binary without this
+    /// function. The window between the final identity check and `rename(2)` is reachable only by them.
+    ///
+    /// **Precondition for direct callers:** those guarantees come from the private staging
+    /// directory `run` creates (`withStagingDirectory`), not from this function. A caller passing a
+    /// `temp` in a directory that untrusted accounts can modify gets the checks, not the isolation.
     public static func verifyAndInstall(temp: String, target: String, expectedHash: String,
                                         verifier: SignatureVerifying) throws {
+        try verifyAndInstall(temp: temp, target: target, expectedHash: expectedHash,
+                             verifier: verifier, beforeRename: nil)
+    }
+
+    /// `beforeRename` is a test seam: it runs after the final hash and `fchmod`, before the last
+    /// identity check.
+    static func verifyAndInstall(temp: String, target: String, expectedHash: String,
+                                 verifier: SignatureVerifying,
+                                 beforeRename: (() throws -> Void)?) throws {
         var installed = false
         defer { if !installed { try? FileManager.default.removeItem(atPath: temp) } }
 
-        let actualHash = try sha256OfFile(at: temp)
+        let notRegular = "downloaded file is no longer a regular file at \(temp) — refusing to install"
+        let fd = openRetryingEINTR(temp, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else {
+            // ELOOP = a symlink at the staged path; anything else is reported as it is.
+            let failure = errno
+            throw SelfUpdateError.installFailed(failure == ELOOP ? notRegular
+                : "could not open downloaded file at \(temp): \(String(cString: strerror(failure))) — refusing to install")
+        }
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFREG else {
+            throw SelfUpdateError.installFailed(notRegular)
+        }
+
+        let actualHash = try sha256(ofDescriptor: fd, path: temp)
         print("Actual SHA-256:   \(actualHash)")
         guard actualHash.lowercased() == expectedHash.lowercased() else {
             throw SelfUpdateError.checksumMismatch(expected: expectedHash, actual: actualHash)
@@ -213,23 +257,112 @@ public enum SelfUpdate {
         print("Checking Developer ID signature and notarization...")
         try verifier.verify(binaryAt: temp)
         print("✓ Signed by team \(verifier.expectedTeamID) and notarized")
+        // codesign and spctl read the path, not our descriptor. That the path named our file while
+        // they ran rests on the private staging directory; a check here would add nothing, since a
+        // swap that is undone before it passes, and one that is not is caught before rename(2).
 
-        // Re-hash right before rename(2): the checks above addressed the file by path, so a file
-        // swapped in after them would otherwise be installed. A replacement cannot match the
-        // maintainer-published hash, so this closes the window to the hash→rename gap.
-        // The hash follows symlinks and rename(2) does not, so a link to genuine bytes would pass
-        // the hash and install the link itself. Require a regular file (lstat, no follow) first.
-        var info = stat()
-        guard lstat(temp, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
-            throw SelfUpdateError.installFailed("downloaded file is no longer a regular file at \(temp) — refusing to install")
-        }
-        let finalHash = try sha256OfFile(at: temp)
+        // Content written into the same file during the check is caught here.
+        let finalHash = try sha256(ofDescriptor: fd, path: temp)
         guard finalHash.lowercased() == expectedHash.lowercased() else {
             throw SelfUpdateError.checksumMismatch(expected: expectedHash, actual: finalHash)
         }
+        // `write` does not set the exec bit. fchmod acts on the checked file; a path-based chmod
+        // would follow a symlink swapped in meanwhile.
+        guard fchmod(fd, 0o755) == 0 else {
+            throw SelfUpdateError.installFailed("chmod +x on temp file: \(String(cString: strerror(errno)))")
+        }
 
+        try beforeRename?()
+        try requireSameFile(at: temp, as: opened)
         try installBinary(from: temp, to: target)
         installed = true
+    }
+
+    /// Refuses unless `path` (not following a final symlink) is a regular file with the identity
+    /// (`st_dev`, `st_ino`) recorded in `opened`.
+    private static func requireSameFile(at path: String, as opened: stat) throws {
+        var current = stat()
+        var rc: Int32
+        repeat { rc = lstat(path, &current) } while rc != 0 && errno == EINTR
+        guard rc == 0, (current.st_mode & S_IFMT) == S_IFREG,
+              current.st_dev == opened.st_dev, current.st_ino == opened.st_ino else {
+            throw SelfUpdateError.installFailed(
+                "downloaded file at \(path) was replaced after verification — refusing to install")
+        }
+    }
+
+    private static func openRetryingEINTR(_ path: String, _ flags: Int32, _ mode: mode_t = 0) -> Int32 {
+        var fd: Int32
+        repeat { fd = open(path, flags, mode) } while fd < 0 && errno == EINTR
+        return fd
+    }
+
+    /// Writes the download to `temp` as a NEW file (`O_CREAT | O_EXCL | O_NOFOLLOW`, mode 0600):
+    /// an existing file, symlink or hard link at that name is refused, never written through.
+    static func writeStaged(_ data: Data, to temp: String) throws {
+        let fd = openRetryingEINTR(temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            throw SelfUpdateError.downloadFailed("could not write temp file at \(temp): \(String(cString: strerror(errno)))")
+        }
+        defer { close(fd) }
+        try data.withUnsafeBytes { raw in
+            var offset = 0
+            while offset < raw.count {
+                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n < 0 {
+                    if errno == EINTR { continue }
+                    throw SelfUpdateError.downloadFailed("could not write temp file at \(temp): \(String(cString: strerror(errno)))")
+                }
+                offset += n
+            }
+        }
+    }
+
+    /// Runs `body` with a private staging directory next to `target` and removes the directory
+    /// afterwards, whether `body` returns or throws.
+    static func withStagingDirectory<T>(nextTo target: String, _ body: (String) async throws -> T) async throws -> T {
+        let staging = try makeStagingDirectory(nextTo: target)
+        defer { try? FileManager.default.removeItem(atPath: staging) }
+        return try await body(staging)
+    }
+
+    /// A private directory for the download: created with `mkdtemp` (mode 0700, inherited ACL
+    /// entries removed) inside the target's directory, so the final rename(2) stays on one volume
+    /// and no other account can enter it. Mode bits do not stop an account that can remove or
+    /// rename entries in the target's directory from replacing the directory itself — that account
+    /// is outside the threat model (see `verifyAndInstall`). The caller removes it.
+    static func makeStagingDirectory(nextTo target: String) throws -> String {
+        let targetURL = URL(fileURLWithPath: target)
+        let template = targetURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(targetURL.lastPathComponent).update-XXXXXX").path
+        var buffer = Array(template.utf8CString)
+        guard let created = mkdtemp(&buffer) else {
+            throw SelfUpdateError.installFailed(
+                "could not create a private staging directory next to \(target): \(String(cString: strerror(errno)))")
+        }
+        let path = String(cString: created)
+        // mkdtemp sets mode 0700, but on APFS/HFS+ the directory can still inherit ACL entries from
+        // its parent that grant other accounts access. Replace them with an empty ACL; any failure
+        // other than "this volume has no ACLs" (ENOTSUP) refuses — including acl_init itself.
+        //
+        // Between mkdtemp and acl_set_file an inherited entry is briefly in effect. An account it
+        // admits could pre-create the staged file's name there; writeStaged's O_EXCL then fails the
+        // update. That is a denial of service only: nothing it placed can be installed.
+        guard let empty = acl_init(0) else {
+            let failure = errno
+            try? FileManager.default.removeItem(atPath: path)
+            throw SelfUpdateError.installFailed(
+                "could not clear inherited ACLs on the staging directory next to \(target): \(String(cString: strerror(failure)))")
+        }
+        let rc = acl_set_file(path, ACL_TYPE_EXTENDED, empty)
+        let failure = errno
+        acl_free(UnsafeMutableRawPointer(empty))
+        if rc != 0 && failure != ENOTSUP {
+            try? FileManager.default.removeItem(atPath: path)
+            throw SelfUpdateError.installFailed(
+                "could not clear inherited ACLs on the staging directory next to \(target): \(String(cString: strerror(failure)))")
+        }
+        return path
     }
 
     /// Strip leading `v` from tags like `v1.7.1` → `1.7.1`.
@@ -368,32 +501,32 @@ public enum SelfUpdate {
         guard FileManager.default.fileExists(atPath: path) else {
             throw SelfUpdateError.installFailed("file does not exist at \(path) — cannot hash")
         }
-        guard let stream = InputStream(fileAtPath: path) else {
-            throw SelfUpdateError.installFailed("could not open \(path) for hashing")
+        let fd = open(path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+            throw SelfUpdateError.installFailed("could not open \(path) for hashing: \(String(cString: strerror(errno)))")
         }
-        stream.open()
-        defer { stream.close() }
-        if let openError = stream.streamError {
-            throw SelfUpdateError.installFailed("could not open \(path) for hashing: \(openError.localizedDescription)")
-        }
+        defer { close(fd) }
+        return try sha256(ofDescriptor: fd, path: path)
+    }
 
+    /// SHA-256 of the whole file behind `fd` (read with `pread` from offset 0, so repeated calls
+    /// hash the same bytes); `path` is only for messages.
+    static func sha256(ofDescriptor fd: Int32, path: String) throws -> String {
         var ctx = CC_SHA256_CTX()
         CC_SHA256_Init(&ctx)
 
         let bufferSize = 65536
         var buffer = [UInt8](repeating: 0, count: bufferSize)
-        while stream.hasBytesAvailable {
-            let bytesRead = buffer.withUnsafeMutableBufferPointer { bufPtr -> Int in
-                guard let baseAddr = bufPtr.baseAddress else { return 0 }
-                return stream.read(baseAddr, maxLength: bufferSize)
-            }
+        var offset: off_t = 0
+        while true {
+            let bytesRead = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress, bufferSize, offset) }
             if bytesRead < 0 {
-                throw SelfUpdateError.installFailed("error reading \(path) for hashing: \(stream.streamError?.localizedDescription ?? "unknown")")
+                if errno == EINTR { continue }
+                throw SelfUpdateError.installFailed("error reading \(path) for hashing: \(String(cString: strerror(errno)))")
             }
             if bytesRead == 0 { break }
-            _ = buffer.withUnsafeBufferPointer { bufPtr in
-                CC_SHA256_Update(&ctx, bufPtr.baseAddress, CC_LONG(bytesRead))
-            }
+            offset += off_t(bytesRead)
+            _ = buffer.withUnsafeBufferPointer { CC_SHA256_Update(&ctx, $0.baseAddress, CC_LONG(bytesRead)) }
         }
 
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
@@ -431,16 +564,15 @@ public enum SelfUpdate {
         return tag
     }
 
-    /// Download the binary asset to a target-directory-adjacent temp
-    /// file. Returns the temp path on success; caller is responsible
-    /// for cleanup via `defer`.
+    /// Download the binary asset to `temp`, a path inside the private staging directory
+    /// `run` created next to the target. Returns `temp`; the caller removes the directory.
     ///
-    /// **che-ical-mcp#49 verify Finding 2**: temp file is staged in the SAME directory
-    /// as the eventual target (not `NSTemporaryDirectory()`) so that the
+    /// **che-ical-mcp#49 verify Finding 2**: the staging directory is inside the target's
+    /// directory (not `NSTemporaryDirectory()`) so that the
     /// final `rename(2)` is guaranteed same-filesystem and atomic. This
     /// means the upgrade is either complete or unchanged — no window
     /// where the target path doesn't exist.
-    private static func downloadBinary(from url: URL, targetPath: String, userAgent: String) async throws -> String {
+    private static func downloadBinary(from url: URL, to temp: String, userAgent: String) async throws -> String {
         var request = URLRequest(url: url)
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 120
@@ -459,15 +591,8 @@ public enum SelfUpdate {
             throw SelfUpdateError.downloadFailed("downloaded asset is empty (0 bytes)")
         }
 
-        // Stage in target's parent directory so the final rename is atomic.
-        let targetURL = URL(fileURLWithPath: targetPath)
-        let parent = targetURL.deletingLastPathComponent().path
-        let temp = "\(parent)/.\(targetURL.lastPathComponent).update-\(UUID().uuidString)"
-        do {
-            try data.write(to: URL(fileURLWithPath: temp))
-        } catch {
-            throw SelfUpdateError.downloadFailed("could not write temp file at \(temp): \(error.localizedDescription)")
-        }
+        // `temp` is inside the private staging directory next to the target (see `run`).
+        try writeStaged(data, to: temp)
         return temp
     }
 
@@ -477,34 +602,23 @@ public enum SelfUpdate {
     /// **che-ical-mcp#49 verify Finding 2 (atomic-replace correctness)**: previous
     /// implementation did `rm -f` THEN `mv`, leaving a window where
     /// the target path didn't exist. If `mv` failed mid-install, the
-    /// system was bricked. Fixed by:
-    /// 1. `chmod 0755` on the staged temp file (in target's parent dir)
-    /// 2. POSIX `rename(2)` — atomically replaces the target IF same FS.
-    ///    Same FS is guaranteed because Step 1 staged the temp in the
-    ///    target's parent directory.
+    /// system was bricked. Fixed by POSIX `rename(2)`, which atomically replaces the target
+    /// when both are on one volume — guaranteed because the staging directory is inside the
+    /// target's directory. (The exec bit is set earlier with `fchmod` on the verified
+    /// descriptor, #1.)
     /// `rename(2)` semantics: target either points at the new file or
     /// the old file at all times — never absent. Stale inode caches
     /// (che-ical-mcp#62 trap) are irrelevant here because rename swaps the directory
     /// entry, not the inode the running process holds.
     private static func installBinary(from tempPath: String, to targetPath: String) throws {
-        let fm = FileManager.default
-
-        // chmod +x on temp file (NSData.write(to:) doesn't preserve exec bit)
-        do {
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tempPath)
-        } catch {
-            // Best-effort cleanup of the staged temp on failure.
-            try? fm.removeItem(atPath: tempPath)
-            throw SelfUpdateError.installFailed("chmod +x on temp file: \(error.localizedDescription)")
-        }
-
         // POSIX rename(2): atomic same-filesystem replacement. Either
         // succeeds (target points at new) or fails leaving target alone.
+        // The exec bit was already set through the verified descriptor (#1).
         let result = rename(tempPath, targetPath)
         if result != 0 {
             let errnoCode = errno
             // Best-effort cleanup of the staged temp on failure.
-            try? fm.removeItem(atPath: tempPath)
+            try? FileManager.default.removeItem(atPath: tempPath)
             let errString = String(cString: strerror(errnoCode))
             throw SelfUpdateError.installFailed(
                 "rename(2) \(tempPath) → \(targetPath) failed: \(errString) (errno=\(errnoCode)). " +
