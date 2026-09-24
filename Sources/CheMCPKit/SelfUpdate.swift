@@ -231,7 +231,12 @@ public enum SelfUpdate {
 
         let notRegular = "downloaded file is no longer a regular file at \(temp) — refusing to install"
         let fd = openRetryingEINTR(temp, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        guard fd >= 0 else { throw SelfUpdateError.installFailed(notRegular) }
+        guard fd >= 0 else {
+            // ELOOP = a symlink at the staged path; anything else is reported as it is.
+            let failure = errno
+            throw SelfUpdateError.installFailed(failure == ELOOP ? notRegular
+                : "could not open downloaded file at \(temp): \(String(cString: strerror(failure))) — refusing to install")
+        }
         defer { close(fd) }
         var opened = stat()
         guard fstat(fd, &opened) == 0, (opened.st_mode & S_IFMT) == S_IFREG else {
@@ -333,16 +338,25 @@ public enum SelfUpdate {
         }
         let path = String(cString: created)
         // mkdtemp sets mode 0700, but on APFS/HFS+ the directory can still inherit ACL entries from
-        // its parent that grant other accounts access. Replace them with an empty ACL.
-        if let empty = acl_init(0) {
-            let rc = acl_set_file(path, ACL_TYPE_EXTENDED, empty)
+        // its parent that grant other accounts access. Replace them with an empty ACL; any failure
+        // other than "this volume has no ACLs" (ENOTSUP) refuses — including acl_init itself.
+        //
+        // Between mkdtemp and acl_set_file an inherited entry is briefly in effect. An account it
+        // admits could pre-create the staged file's name there; writeStaged's O_EXCL then fails the
+        // update. That is a denial of service only: nothing it placed can be installed.
+        guard let empty = acl_init(0) else {
             let failure = errno
-            acl_free(UnsafeMutableRawPointer(empty))
-            if rc != 0 && failure != ENOTSUP {
-                try? FileManager.default.removeItem(atPath: path)
-                throw SelfUpdateError.installFailed(
-                    "could not clear inherited ACLs on the staging directory next to \(target): \(String(cString: strerror(failure)))")
-            }
+            try? FileManager.default.removeItem(atPath: path)
+            throw SelfUpdateError.installFailed(
+                "could not clear inherited ACLs on the staging directory next to \(target): \(String(cString: strerror(failure)))")
+        }
+        let rc = acl_set_file(path, ACL_TYPE_EXTENDED, empty)
+        let failure = errno
+        acl_free(UnsafeMutableRawPointer(empty))
+        if rc != 0 && failure != ENOTSUP {
+            try? FileManager.default.removeItem(atPath: path)
+            throw SelfUpdateError.installFailed(
+                "could not clear inherited ACLs on the staging directory next to \(target): \(String(cString: strerror(failure)))")
         }
         return path
     }

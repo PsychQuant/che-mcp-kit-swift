@@ -197,6 +197,26 @@ struct InstallWindowTests {
         #expect(!hasEntry, "staging directory still carries an inherited ACL entry")
     }
 
+    @Test func `An open failure names its cause, and a symlink reads as not a regular file`() throws {
+        let s = try Self.setUp(); defer { try? FileManager.default.removeItem(at: s.dir) }
+        let missing = s.dir.appendingPathComponent("gone").path
+        do {
+            try SelfUpdate.verifyAndInstall(temp: missing, target: s.target, expectedHash: s.hash, verifier: PassingVerifier())
+            Issue.record("expected refusal")
+        } catch SelfUpdate.SelfUpdateError.installFailed(let detail) {
+            #expect(detail == "could not open downloaded file at \(missing): No such file or directory — refusing to install")
+        }
+        let link = s.dir.appendingPathComponent("link").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: s.temp)
+        do {
+            try SelfUpdate.verifyAndInstall(temp: link, target: s.target, expectedHash: s.hash, verifier: PassingVerifier())
+            Issue.record("expected refusal")
+        } catch SelfUpdate.SelfUpdateError.installFailed(let detail) {
+            #expect(detail == "downloaded file is no longer a regular file at \(link) — refusing to install")
+        }
+        #expect(try String(contentsOfFile: s.target, encoding: .utf8) == "old")
+    }
+
     @Test func `The installed file is executable (0755)`() throws {
         let s = try Self.setUp(); defer { try? FileManager.default.removeItem(at: s.dir) }
         try SelfUpdate.verifyAndInstall(temp: s.temp, target: s.target, expectedHash: s.hash,
