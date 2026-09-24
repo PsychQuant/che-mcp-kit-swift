@@ -189,12 +189,28 @@ struct InstallWindowTests {
         try chmod.run(); chmod.waitUntilExit()
         #expect(chmod.terminationStatus == 0)
 
+        // The parent really passes the entry on: a plain child directory inherits it.
+        let control = dir.appendingPathComponent("control").path
+        try FileManager.default.createDirectory(atPath: control, withIntermediateDirectories: false)
+        #expect(Self.aclEntryCount(control) == 1, "fixture: parent ACL is not inherited")
+
         let staging = try SelfUpdate.makeStagingDirectory(nextTo: dir.appendingPathComponent("Binary").path)
-        let acl = acl_get_file(staging, ACL_TYPE_EXTENDED)
-        defer { if let acl { acl_free(UnsafeMutableRawPointer(acl)) } }
+        #expect(Self.aclEntryCount(staging) == 0, "staging directory still carries an inherited ACL entry")
+    }
+
+    /// Number of extended ACL entries on `path`; `nil` when the ACL cannot be read for a reason
+    /// other than "there is none" — so a read failure can never pass as "no entries".
+    private static func aclEntryCount(_ path: String) -> Int? {
+        guard let acl = acl_get_file(path, ACL_TYPE_EXTENDED) else { return errno == ENOENT ? 0 : nil }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var entry: acl_entry_t?
-        let hasEntry = acl != nil && acl_get_entry(acl, ACL_FIRST_ENTRY.rawValue, &entry) == 0
-        #expect(!hasEntry, "staging directory still carries an inherited ACL entry")
+        var count = 0
+        var which = ACL_FIRST_ENTRY.rawValue
+        while acl_get_entry(acl, which, &entry) == 0 {
+            count += 1
+            which = ACL_NEXT_ENTRY.rawValue
+        }
+        return count
     }
 
     @Test func `An open failure names its cause, and a symlink reads as not a regular file`() throws {

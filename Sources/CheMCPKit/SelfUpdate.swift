@@ -215,6 +215,10 @@ public enum SelfUpdate {
     /// staged file. Not defended, by design: the same user, and any account that can remove or rename
     /// entries in the target's directory; both can replace the installed binary without this
     /// function. The window between the final identity check and `rename(2)` is reachable only by them.
+    ///
+    /// **Precondition for direct callers:** those guarantees come from the private staging
+    /// directory `run` creates (`withStagingDirectory`), not from this function. A caller passing a
+    /// `temp` in a directory that untrusted accounts can modify gets the checks, not the isolation.
     public static func verifyAndInstall(temp: String, target: String, expectedHash: String,
                                         verifier: SignatureVerifying) throws {
         try verifyAndInstall(temp: temp, target: target, expectedHash: expectedHash,
